@@ -28,6 +28,10 @@ class Wav2VecCriterionConfig(FairseqDataclass):
         default=None,
         metadata={"help": "weights for additional loss terms (not first one)"},
     )
+    cc_weights: Optional[List[float]] = field(
+        default=None,
+        metadata={"help": "alpha, beta and gamma values which decide the weights for contrastive loss (alpha), and each of the terms of the cross-contrastive loss (beta and gamma)."},
+    )
     log_keys: List[str] = field(
         default_factory=lambda: [],
         metadata={"help": "output keys to log"},
@@ -36,10 +40,11 @@ class Wav2VecCriterionConfig(FairseqDataclass):
 
 @register_criterion("wav2vec", dataclass=Wav2VecCriterionConfig)
 class Wav2vecCriterion(FairseqCriterion):
-    def __init__(self, task, infonce=False, loss_weights=None, log_keys=None):
+    def __init__(self, task, infonce=False, loss_weights=None, cc_weights = None, log_keys=None):
         super().__init__(task)
         self.infonce = infonce
         self.loss_weights = loss_weights
+        self.cc_weights = cc_weights
         self.log_keys = [] if log_keys is None else log_keys
 
     def forward(self, model, sample, reduce=True):
@@ -53,6 +58,10 @@ class Wav2vecCriterion(FairseqCriterion):
         net_output = model(**sample["net_input"])
         logits = model.get_logits(net_output).float()
         target = model.get_targets(sample, net_output)
+        logits_xya = model.get_logits_xya(net_output).float()
+        target_xya = model.get_targets_xya(sample, net_output)
+        logits_xay = model.get_logits_xay(net_output).float()
+        target_xay = model.get_targets_xay(sample, net_output)
         self.xla = is_xla_tensor(logits)
 
         # XXX: handle weights on xla.
@@ -66,7 +75,14 @@ class Wav2vecCriterion(FairseqCriterion):
 
         reduction = "none" if ((not reduce) or self.xla) else "sum"
         if self.infonce:
+            # computing the contrastive loss (L_c)
             loss = F.cross_entropy(logits, target, reduction=reduction)
+
+            # computing the cross-contrastive loss (L_cross)
+            xya_loss = F.cross_entropy(logits_xya, target_xya, reduction=reduction)
+
+            # computing the cross-contrastive loss (L_cross')
+            xay_loss = F.cross_entropy(logits_xay, target_xay, reduction=reduction)
         else:
             loss = F.binary_cross_entropy_with_logits(
                 logits, target.float(), weights, reduction=reduction
@@ -82,6 +98,11 @@ class Wav2vecCriterion(FairseqCriterion):
                 .reshape(logits.size(0))
             )
             loss = (loss * mi).sum() if reduce else (loss * mi)
+
+        contrastive_loss = loss.detach().clone()
+        alpha, beta, gamma = self.cc_weights
+        loss = alpha * loss
+        loss += beta*xya_loss + gamma*xay_loss
 
         if "sample_size" in sample:
             sample_size = sample["sample_size"]
@@ -109,6 +130,9 @@ class Wav2vecCriterion(FairseqCriterion):
 
         logging_output = {
             "loss": loss.item() if (reduce and not self.xla) else loss.detach(),
+            "contrastive_loss": contrastive_loss.item(),
+            "xay_loss": xay_loss.item(),
+            "xya_loss": xya_loss.item(),
             "ntokens": sample_size,
             "nsentences": sample["id"].numel(),
             "sample_size": sample_size,
@@ -167,6 +191,9 @@ class Wav2vecCriterion(FairseqCriterion):
     def reduce_metrics(logging_outputs) -> None:
         """Aggregate logging outputs from data parallel training."""
         loss_sum = utils.item(sum(log.get("loss", 0) for log in logging_outputs))
+        contrastive_loss_sum = utils.item(sum(log.get("contrastive_loss", 0) for log in logging_outputs))
+        xay_loss_sum = utils.item(sum(log.get("xay_loss", 0) for log in logging_outputs))
+        xya_loss_sum = utils.item(sum(log.get("xya_loss", 0) for log in logging_outputs))
         ntokens = utils.item(sum(log.get("ntokens", 0) for log in logging_outputs))
         nsentences = utils.item(
             sum(log.get("nsentences", 0) for log in logging_outputs)
@@ -177,6 +204,15 @@ class Wav2vecCriterion(FairseqCriterion):
 
         metrics.log_scalar(
             "loss", loss_sum / (sample_size or 1) / math.log(2), sample_size, round=3
+        )
+        metrics.log_scalar(
+            "contrastive_loss", contrastive_loss_sum / (sample_size or 1) / math.log(2), sample_size, round=3
+        )
+        metrics.log_scalar(
+            "xay_loss", xay_loss_sum / (sample_size or 1) / math.log(2), sample_size, round=3
+        )
+        metrics.log_scalar(
+            "xya_loss", xya_loss_sum / (sample_size or 1) / math.log(2), sample_size, round=3
         )
         metrics.log_scalar("ntokens", ntokens)
         metrics.log_scalar("nsentences", nsentences)

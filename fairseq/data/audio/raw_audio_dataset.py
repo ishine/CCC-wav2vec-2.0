@@ -22,6 +22,8 @@ from fairseq.data.audio.audio_utils import (
 )
 from fairseq.data.text_compressor import TextCompressor, TextCompressionLevel
 
+from torchaudio_augmentations import Compose, RandomApply, Noise, Reverb, RandomBackgroundNoise
+import torchaudio
 
 logger = logging.getLogger(__name__)
 
@@ -76,15 +78,16 @@ class RawAudioDataset(FairseqDataset):
                 feats = F.layer_norm(feats, feats.shape)
         return feats
 
-    def crop_to_max_size(self, wav, target_size):
+    def crop_to_max_size(self, wav, target_size, start=-100):
         size = len(wav)
         diff = size - target_size
         if diff <= 0:
             return wav
 
-        start = np.random.randint(0, diff + 1)
+        if start == -100:
+            start = np.random.randint(0, diff + 1)
         end = size - diff + start
-        return wav[start:end]
+        return wav[start:end], start
 
     def _compute_mask_indices(self, dims, padding_mask):
         B, T, C = dims
@@ -130,11 +133,16 @@ class RawAudioDataset(FairseqDataset):
 
         sources = [s["source"] for s in samples]
         sizes = [len(s) for s in sources]
+        start_offsets = []
+        augmentations = [s["augmentation"] for s in samples]
+        a_sizes = [len(s) for s in augmentations]
 
         if self.pad:
             target_size = min(max(sizes), self.max_sample_size)
+            a_target_size = min(max(a_sizes), self.max_sample_size)
         else:
             target_size = min(min(sizes), self.max_sample_size)
+            a_target_size = min(min(a_sizes), self.max_sample_size)
 
         collated_sources = sources[0].new_zeros(len(sources), target_size)
         padding_mask = (
@@ -142,6 +150,7 @@ class RawAudioDataset(FairseqDataset):
         )
         for i, (source, size) in enumerate(zip(sources, sizes)):
             diff = size - target_size
+            s_offset = 0
             if diff == 0:
                 collated_sources[i] = source
             elif diff < 0:
@@ -151,9 +160,30 @@ class RawAudioDataset(FairseqDataset):
                 )
                 padding_mask[i, diff:] = True
             else:
-                collated_sources[i] = self.crop_to_max_size(source, target_size)
+                collated_sources[i], s_offset = self.crop_to_max_size(source, target_size)
+            start_offsets.append(s_offset)
 
-        input = {"source": collated_sources}
+        aug_collated_sources = augmentations[0].new_zeros(len(augmentations), a_target_size)
+        aug_padding_mask = (
+            torch.BoolTensor(aug_collated_sources.shape).fill_(False) if self.pad else None
+        )
+        for i, (aug, a_size) in enumerate(zip(augmentations, a_sizes)):
+            diff = a_size - a_target_size
+            if diff == 0:
+                aug_collated_sources[i] = aug
+            elif diff < 0:
+                assert self.pad
+                aug_collated_sources[i] = torch.cat(
+                    [aug, aug.new_full((-diff,), 0.0)]
+                )
+                aug_padding_mask[i, diff:] = True
+            else:
+                aug_collated_sources[i], _ = self.crop_to_max_size(aug, a_target_size, start_offsets[i])
+
+        # collecting both the source and the augmentation
+        sna = [collated_sources]
+        sna.append(aug_collated_sources)
+        input = {"source": sna}
         out = {"id": torch.LongTensor([s["id"] for s in samples])}
         if self.pad:
             input["padding_mask"] = padding_mask
@@ -307,7 +337,6 @@ class FileAudioDataset(RawAudioDataset):
         self.set_bucket_info(num_buckets)
 
     def __getitem__(self, index):
-        import soundfile as sf
 
         fn = self.fnames[index]
         fn = fn if isinstance(self.fnames, list) else fn.as_py()
@@ -319,11 +348,25 @@ class FileAudioDataset(RawAudioDataset):
             assert is_sf_audio_data(byte_data)
             path_or_fp = io.BytesIO(byte_data)
 
-        wav, curr_sample_rate = sf.read(path_or_fp, dtype="float32")
+        wav, curr_sample_rate = torchaudio.load(path_or_fp)
 
-        feats = torch.from_numpy(wav).float()
+        path_to_musan_noise_set = '/nlsasfs/home/nltm-pilot/vasistal/Database/Musan/musan/noise/free-sound'
+        
+        # defining the transformation to be applied over the original sample to generate the augmentation
+        transforms = [
+            RandomApply([Noise(min_snr=0.001, max_snr=0.7)], p=0.6),
+            RandomApply([Reverb(sample_rate=curr_sample_rate)], p=0.7),
+            RandomApply([RandomBackgroundNoise(curr_sample_rate, path_to_musan_noise_set)], p=0.8),
+        ]
+        transform = Compose(transforms=transforms)
+
+        transformed_audio =  transform(wav)
+        feats = wav.flatten()
+        aug_feats = transformed_audio.flatten()
         feats = self.postprocess(feats, curr_sample_rate)
-        return {"id": index, "source": feats}
+        aug_feats = self.postprocess(aug_feats, curr_sample_rate)
+
+        return {"id": index, "source": feats, "augmentation": aug_feats}
 
 
 class BinarizedAudioDataset(RawAudioDataset):

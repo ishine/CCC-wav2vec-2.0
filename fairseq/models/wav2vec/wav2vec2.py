@@ -31,9 +31,11 @@ from fairseq.modules import (
 from fairseq.modules.checkpoint_activations import checkpoint_wrapper
 from fairseq.modules.conformer_layer import ConformerWav2Vec2EncoderLayer
 from fairseq.modules.transformer_sentence_encoder import init_bert_params
-from fairseq.utils import buffered_arange, index_put, is_xla_tensor
+from fairseq.utils import buffered_arange, index_put, is_xla_tensor, index_put_scale
 
 from .utils import pad_to_multiple
+
+from fast_pytorch_kmeans import KMeans
 
 EXTRACTOR_MODE_CHOICES = ChoiceEnum(["default", "layer_norm"])
 MASKING_DISTRIBUTION_CHOICES = ChoiceEnum(["static", "uniform", "normal", "poisson"])
@@ -289,6 +291,16 @@ class Wav2Vec2Config(FairseqDataclass):
     )
     fp16: bool = field(default=False, metadata={"help": "If fp16 is being used"})
 
+    # Clustering Module
+    cluster_factor: int = field(
+        default=1,
+        metadata={"help": "Cluster Factor for the clustering module for clustering the sampled negatives."},
+    )
+    scale_factor: float = field(
+        default=1.0,
+        metadata={"help": "Scale Factor for the clustering module to scale the influence of non-informative negatives."},
+    )
+
 
 @register_model("wav2vec2", dataclass=Wav2Vec2Config)
 class Wav2Vec2Model(BaseFairseqModel):
@@ -537,9 +549,9 @@ class Wav2Vec2Model(BaseFairseqModel):
         ).permute(
             2, 0, 1, 3
         )  # to NxBxTxC
-        return negs, neg_idxs
+        return negs, neg_idxs.view(-1)
 
-    def compute_preds(self, x, y, negatives):
+    def compute_preds_scale(self, x, y, negatives, filter_negs, sf=0.3):
 
         neg_is_pos = (y == negatives).all(-1)
         y = y.unsqueeze(0)
@@ -559,6 +571,8 @@ class Wav2Vec2Model(BaseFairseqModel):
                 )
             logits[1:] = index_put(logits[1:], neg_is_pos, self._inftensor)
 
+            # applying the scaling factor for the logits corresponding to filtered negatives
+            logits[1:] = index_put_scale(logits[1:], filter_negs, sf)
         return logits
 
     def _get_feat_extract_output_lengths(self, input_lengths: torch.LongTensor):
@@ -590,13 +604,17 @@ class Wav2Vec2Model(BaseFairseqModel):
         padding_count=None,
     ):
 
+        # extracting both the source and the augmented audios from source
+        source_audios = source[0]
+        aug_audios = source[1]
+
         if self.feature_grad_mult > 0:
-            features = self.feature_extractor(source)
+            features = self.feature_extractor(source_audios)
             if self.feature_grad_mult != 1.0:
                 features = GradMultiply.apply(features, self.feature_grad_mult)
         else:
             with torch.no_grad():
-                features = self.feature_extractor(source)
+                features = self.feature_extractor(source_audios)
 
         features_pen = features.float().pow(2).mean()
 
@@ -682,6 +700,47 @@ class Wav2Vec2Model(BaseFairseqModel):
                 "layer_results": layer_results,
             }
 
+        ## Generating the features for the augmentation
+        if self.feature_grad_mult > 0:
+            aug_features = self.feature_extractor(aug_audios)
+            if self.feature_grad_mult != 1.0:
+                aug_features = GradMultiply.apply(aug_features, self.feature_grad_mult)
+        else:
+            with torch.no_grad():
+                aug_features = self.feature_extractor(aug_audios)
+
+        aug_features_pen = aug_features.float().pow(2).mean()
+
+        aug_features = aug_features.transpose(1, 2)
+        aug_features = self.layer_norm(aug_features)
+        aug_unmasked_features = aug_features.clone()
+
+        if self.post_extract_proj is not None:
+            aug_features = self.post_extract_proj(aug_features)
+
+        aug_features = self.dropout_input(aug_features)
+        aug_unmasked_features = self.dropout_features(aug_unmasked_features)
+
+        if mask:
+            # applying the same mask (as used for the original sample features) over the augmented sample features
+            # this consistency is needed as we are going to compute cross-contrastive losses as well
+            x_aug = index_put(aug_features, mask_indices, self.mask_emb)
+            if not is_xla_tensor(x_aug) and mask_indices is not None:
+                # tpu-comment: reducing the size in a dynamic way causes
+                # too many recompilations on xla.
+                y_aug = aug_unmasked_features[mask_indices].view(
+                    aug_unmasked_features.size(0), -1, aug_unmasked_features.size(-1)
+                )
+            else:
+                y_aug = aug_unmasked_features
+        else:
+            x_aug = aug_features
+            y_aug = aug_unmasked_features
+            mask_indices = None
+
+        # forward pass of the augmentation through the encoder
+        x_aug, _ = self.encoder(x_aug, padding_mask=padding_mask, layer=layer)
+
         if self.quantizer:
             if self.negatives_from_everywhere:
                 q = self.quantizer(unmasked_features, produce_targets=False)
@@ -709,9 +768,21 @@ class Wav2Vec2Model(BaseFairseqModel):
 
                 y = self.project_q(y)
 
-                negs, _ = self.sample_negatives(
+                negs, neg_idxs = self.sample_negatives(
                     y,
                     y.size(1),
+                    padding_count=padding_count,
+                )
+
+                # sample negatives for the augmentation
+                q_aug = self.quantizer(y_aug, produce_targets=False)
+                y_aug = q_aug["x"]
+
+                y_aug = self.project_q(y_aug)
+
+                negs_aug, neg_aug_idxs = self.sample_negatives(
+                    y_aug,
+                    y_aug.size(1),
                     padding_count=padding_count,
                 )
 
@@ -745,16 +816,64 @@ class Wav2Vec2Model(BaseFairseqModel):
             # tpu-comment: reducing the size in a dynamic way causes
             # too many recompilations on xla.
             x = x[mask_indices].view(x.size(0), -1, x.size(-1))
+            x_aug = x_aug[mask_indices].view(x_aug.size(0), -1, x_aug.size(-1))
 
         if self.target_glu:
             y = self.target_glu(y)
             negs = self.target_glu(negs)
 
         x = self.final_proj(x)
-        x = self.compute_preds(x, y, negs)
+        x_aug = self.final_proj(x_aug)
+
+        # Defining the k-means clustering module
+        kmeans = KMeans(n_clusters=max(2, x.shape[1]//self.cfg.cluster_factor), mode='cosine', verbose=0)
+
+        # normalize the sampled negatives of the original and the augmentation before clustering
+        norm_y = F.normalize(y, dim=2)
+        norm_y_aug = F.normalize(y_aug, dim=2)
+
+        bsz, tsz, fsz = norm_y.shape
+        # pooling the normalized negatives before clustering
+        data = torch.stack([norm_y.view(-1, fsz),norm_y_aug.view(-1, fsz)]).view(-1, fsz)
+        data = data.to(torch.float)
+        
+        # clustering and obtaining the cluster IDs
+        labels = kmeans.fit_predict(data)
+        clus_labels, clus_labels_aug = torch.split(labels, bsz*tsz)
+
+        clus_labels = torch.reshape(clus_labels, (bsz, tsz))
+        neg_labels = clus_labels.view(-1)[neg_idxs]
+        clus_labels = torch.reshape(clus_labels, (norm_y.size(0), norm_y.size(1), 1))
+        neg_labels = neg_labels.view(norm_y.size(0), norm_y.size(1), self.n_negatives, 1).permute(
+            2, 0, 1, 3
+        )
+
+        # filter those negatives which belong to the same cluster as the positive for the original sample
+        filter_negs = (clus_labels == neg_labels).all(-1)
+
+
+        clus_labels_aug = torch.reshape(clus_labels_aug, (bsz, tsz))
+        neg_labels_aug = clus_labels_aug.view(-1)[neg_aug_idxs]
+        clus_labels_aug = torch.reshape(clus_labels_aug, (norm_y_aug.size(0), norm_y_aug.size(1), 1))
+        neg_labels_aug = neg_labels_aug.view(norm_y_aug.size(0), norm_y_aug.size(1), self.n_negatives, 1).permute(
+            2, 0, 1, 3
+        )
+
+        # filter those negatives which belong to the same cluster as the positive for the augmented sample
+        filter_negs_aug = (clus_labels_aug == neg_labels_aug).all(-1)
+
+        # logits for cross-contrastive loss (L_cross)
+        x_ya = self.compute_preds_scale(x, y_aug, negs_aug, filter_negs_aug, self.cfg.scale_factor)
+        # logits for cross-contrastive loss (L_cross')
+        xa_y = self.compute_preds_scale(x_aug, y, negs, filter_negs, self.cfg.scale_factor)
+
+        # logits for contrastive loss (L_c)
+        x = self.compute_preds_scale(x, y, negs, filter_negs, self.cfg.scale_factor)
 
         result = {
             "x": x,
+            "xa_y": xa_y,
+            "x_ya": x_ya,
             "padding_mask": padding_mask,
             "features_pen": features_pen,
         }
@@ -788,6 +907,26 @@ class Wav2Vec2Model(BaseFairseqModel):
 
     def get_targets(self, sample, net_output, expand_steps=True):
         x = net_output["x"]
+        return x.new_zeros(x.size(1) * x.size(2), dtype=torch.long)
+
+    def get_logits_xay(self, net_output):
+        logits = net_output["xa_y"]
+        logits = logits.transpose(0, 2)
+        logits = logits.reshape(-1, logits.size(-1))
+        return logits
+
+    def get_targets_xay(self, sample, net_output, expand_steps=True):
+        x = net_output["xa_y"]
+        return x.new_zeros(x.size(1) * x.size(2), dtype=torch.long)
+
+    def get_logits_xya(self, net_output):
+        logits = net_output["x_ya"]
+        logits = logits.transpose(0, 2)
+        logits = logits.reshape(-1, logits.size(-1))
+        return logits
+
+    def get_targets_xya(self, sample, net_output, expand_steps=True):
+        x = net_output["x_ya"]
         return x.new_zeros(x.size(1) * x.size(2), dtype=torch.long)
 
     def get_extra_losses(self, net_output):
